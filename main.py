@@ -2,20 +2,26 @@ import cv2
 import numpy as np
 import time
 import logging
+import threading
 from datetime import datetime
 from ultralytics import YOLO
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
-from ttkbootstrap.scrolled import ScrolledText # Widget de log com scroll
+from ttkbootstrap.scrolled import ScrolledText 
 from PIL import Image, ImageTk
 
+# --- MODBUS IMPORTS ---
+from pymodbus.server import StartTcpServer
+from pymodbus.datastore import ModbusSequentialDataBlock, ModbusDeviceContext, ModbusServerContext
+
 # ---------------------------------
-# CONFIGURAÇÕES E LOGGING EXTERNO
+# CONFIGURAÇÕES
 # ---------------------------------
 MODEL_PATH = "best.pt"
 CONF_LEVEL = 0.45 
+MODBUS_IP = "192.168.1.11"
+MODBUS_PORT = 502
 
-# Configura o log para salvar em arquivo .log
 logging.basicConfig(
     filename='sistema_seguranca.log',
     level=logging.INFO,
@@ -26,15 +32,18 @@ logging.basicConfig(
 class DetectionApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("SENTRY VISION v3.2 - Monitoramento com Log de Eventos")
+        self.root.title("SENTRY VISION v3.2 - Monitoramento + Modbus TCP")
         self.root.geometry("1350x900")
         self.root.minsize(1200, 800)
         
         self.style = ttk.Style("darkly")
         
+        # --- INICIALIZAÇÃO MODBUS ---
+        self.setup_modbus()
+        
         # Estado lógico
         self.running = False
-        self.last_status = "STANDBY" # Controle para evitar logs repetidos
+        self.last_status = "STANDBY"
         
         try:
             self.model = YOLO(MODEL_PATH)
@@ -47,49 +56,66 @@ class DetectionApp:
         self.kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]]) 
 
         self.create_layout()
-        self.add_log("Sistema iniciado e pronto para operação.", INFO)
+        self.add_log("Sistema iniciado. Servidor Modbus aguardando conexão.", INFO)
+
+    def setup_modbus(self):
+        """Configura a memória Modbus e inicia o servidor em background"""
+        self.store = ModbusDeviceContext(
+            di=ModbusSequentialDataBlock(0, [0]*100),
+            co=ModbusSequentialDataBlock(0, [0]*100),
+            hr=ModbusSequentialDataBlock(0, [0]*100),
+            ir=ModbusSequentialDataBlock(0, [0]*100) # Input Registers
+        )
+        self.context = ModbusServerContext(devices=self.store, single=True)
+        
+        # Thread para o servidor não travar a interface gráfica
+        self.server_thread = threading.Thread(
+            target=lambda: StartTcpServer(self.context, address=(MODBUS_IP, MODBUS_PORT)),
+            daemon=True
+        )
+        self.server_thread.start()
+
+    def update_plc(self, has_danger, count):
+        """Atualiza os valores nos registradores que o CLP lê"""
+        # IR 0: Alarme (1 ou 0)
+        # IR 1: Quantidade de pessoas sem capacete
+        alarm_value = 0 if has_danger else 1
+        self.store.setValues(4, 0, [alarm_value]) # 4 = Input Register
+        self.store.setValues(4, 1, [count])
 
     def add_log(self, message, level=INFO):
-        """Adiciona uma mensagem ao widget de Log na UI e ao arquivo log."""
         timestamp = datetime.now().strftime("%H:%M:%S")
         formatted_msg = f"[{timestamp}] {message}\n"
         
-        # Insere na UI com cor baseada no nível
         bootstyle = SECONDARY
         if level == DANGER: bootstyle = DANGER
         if level == SUCCESS: bootstyle = SUCCESS
-        if level == INFO: bootstyle = INFO
         
         self.log_widget.insert(END, formatted_msg, bootstyle)
-        self.log_widget.see(END) # Faz o scroll automático
+        self.log_widget.see(END)
         
-        # Salva no arquivo físico
         if level == DANGER: logging.warning(message)
         else: logging.info(message)
 
     def setup_camera(self):
-        """Configura a câmera e loga as propriedades"""
-        self.camera = cv2.VideoCapture(1)
-        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-        self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.camera = cv2.VideoCapture(0)
+        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280) # Ajustado para performance
+        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         
         if self.camera.isOpened():
-            self.add_log("Câmera conectada em Alta Definição (1080p).", SUCCESS)
+            self.add_log(f"Câmera OK. Servidor Modbus em {MODBUS_IP}", SUCCESS)
         else:
             self.add_log("Falha ao conectar com a câmera!", DANGER)
 
     def create_layout(self):
-        """Layout Estático com painel de Log inferior"""
         self.main_frame = ttk.Frame(self.root, padding=10)
         self.main_frame.pack(fill=BOTH, expand=True)
 
-        # --- SIDEBAR DIREITA ---
+        # SIDEBAR
         self.sidebar = ttk.Frame(self.main_frame, width=350)
         self.sidebar.pack(side=RIGHT, fill=Y, padx=(10, 0))
         self.sidebar.pack_propagate(False)
 
-        # Status Badge
         status_top = ttk.Frame(self.sidebar)
         status_top.pack(fill=X, pady=5)
         self.cam_led = ttk.Label(status_top, text="●", font=("Helvetica", 22), foreground="red")
@@ -103,8 +129,8 @@ class DetectionApp:
         )
         self.alert_box.pack(fill=X, pady=10)
 
-        # Dashboard Métricas
-        metrics_group = ttk.Labelframe(self.sidebar, text=" TELEMETRIA ", padding=15)
+        # Métricas
+        metrics_group = ttk.Labelframe(self.sidebar, text=" TELEMETRIA & PLC ", padding=15)
         metrics_group.pack(fill=X, pady=10)
 
         def add_metric(label, bootstyle):
@@ -115,18 +141,16 @@ class DetectionApp:
             val.pack(side=RIGHT)
             return val
 
-        self.ui_danger = add_metric("RISCOS DETECTADOS:", DANGER)
-        self.ui_safe = add_metric("SEGUROS (OK):", SUCCESS)
+        self.ui_danger = add_metric("SEM CAPACETE (IR 0):", DANGER)
+        self.ui_safe = add_metric("COM CAPACETE:", SUCCESS)
         self.ui_fps = add_metric("FPS:", SECONDARY)
 
-        # --- NOVO: LOG DE ATIVIDADES ---
         log_group = ttk.Labelframe(self.sidebar, text=" LOG DE EVENTOS ", padding=5)
         log_group.pack(fill=BOTH, expand=True, pady=10)
         
         self.log_widget = ScrolledText(log_group, height=10, font=("Consolas", 9), autohide=True)
         self.log_widget.pack(fill=BOTH, expand=True)
 
-        # Botões
         self.btn_stop = ttk.Button(self.sidebar, text="⏹ PARAR MONITORAMENTO", bootstyle=DANGER, 
                                   command=self.stop, state=DISABLED, padding=10)
         self.btn_stop.pack(side=BOTTOM, fill=X, pady=5)
@@ -135,11 +159,9 @@ class DetectionApp:
                                    command=self.start, padding=10)
         self.btn_start.pack(side=BOTTOM, fill=X, pady=5)
 
-        # --- ÁREA DO VÍDEO ---
+        # VÍDEO
         self.video_container = ttk.Labelframe(self.main_frame, text=" MONITORAMENTO HD ", bootstyle=INFO)
         self.video_container.pack(side=LEFT, fill=BOTH, expand=True)
-        self.video_container.pack_propagate(False)
-
         self.video_label = ttk.Label(self.video_container, background="#000")
         self.video_label.pack(fill=BOTH, expand=True, padx=2, pady=2)
 
@@ -151,7 +173,7 @@ class DetectionApp:
             self.btn_stop.config(state=NORMAL)
             self.cam_led.config(foreground="#00FF00")
             self.cam_text.config(text=" SISTEMA ONLINE")
-            self.add_log("Monitoramento iniciado pelo usuário.", SUCCESS)
+            self.add_log("Monitoramento iniciado.", SUCCESS)
             self.update_frame()
 
     def stop(self):
@@ -164,7 +186,8 @@ class DetectionApp:
             self.cam_text.config(text=" SISTEMA OFFLINE")
             self.alert_box.config(text="OFFLINE", bootstyle="secondary-inverse")
             self.video_label.config(image="")
-            self.add_log("Monitoramento interrompido pelo usuário.", WARNING)
+            self.update_plc(False, 0) # Zera o sinal no CLP ao parar
+            self.add_log("Monitoramento interrompido.", WARNING)
 
     def process_frame(self, frame):
         frame = cv2.filter2D(frame, -1, self.kernel)
@@ -189,18 +212,18 @@ class DetectionApp:
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
             cv2.putText(frame, tag, (x1, y1 - 10), 2, 0.5, color, 1)
 
+        # --- LÓGICA MODBUS (ENVIO PARA O CLP) ---
+        self.update_plc(danger_in_frame, count_danger)
+
         is_safe = not danger_in_frame
-        
-        # LOGICA DE LOG DE EVENTO (Apenas quando o status muda)
         new_status = "SAFE" if is_safe else "DANGER"
         if new_status != self.last_status:
             if not is_safe:
-                self.add_log(f"VIOLAÇÃO DETECTADA: {count_danger} pessoa(s) sem EPI!", DANGER)
+                self.add_log(f"VIOLAÇÃO! Sinal enviado ao CLP.", DANGER)
             elif is_safe and count_safe > 0:
-                self.add_log("Ambiente normalizado. Todos com EPI.", SUCCESS)
+                self.add_log("Seguro. Sinal de alarme limpo.", SUCCESS)
             self.last_status = new_status
 
-        # Borda de aviso
         if not is_safe:
             cv2.rectangle(frame, (0,0), (frame.shape[1], frame.shape[0]), (0,0,255), 15)
         
@@ -218,7 +241,7 @@ class DetectionApp:
         self.fps = 1 / (curr_time - self.prev_time) if (curr_time - self.prev_time) > 0 else 0
         self.prev_time = curr_time
 
-        # Redimensionamento Estável
+        # Resize display
         tw, th = self.video_label.winfo_width(), self.video_label.winfo_height()
         if tw > 100:
             h, w = processed.shape[:2]
@@ -241,7 +264,6 @@ class DetectionApp:
         self.root.after(10, self.update_frame)
 
     def on_close(self):
-        self.add_log("Finalizando aplicação...", INFO)
         self.stop()
         self.root.destroy()
 
